@@ -14,7 +14,9 @@ module ActiveMerchant
       
       RESOURCES = {
         :rates => 'ups.app/xml/Rate',
-        :track => 'ups.app/xml/Track'
+        :track => 'ups.app/xml/Track',
+        :confirm => 'ups.app/xml/ShipConfirm',
+        :accept => 'ups.app/xml/ShipAccept'
       }
       
       PICKUP_CODES = HashWithIndifferentAccess.new({
@@ -112,8 +114,18 @@ module ActiveMerchant
         response = commit(:track, save_request(access_request + tracking_request), (options[:test] || false))
         parse_tracking_response(response, options)
       end
+
+      def shipment_request(origin, destination, packages, options={})
+        origin, destination = upsified_location(origin), upsified_location(destination)
+        options = @options.merge(options)
+        packages = Array(packages)
+        access_request = build_access_request
+        ship_request = build_shipment_request(origin, destination, packages, options)
+        response = commit(:confirm, save_request(access_request + ship_request), (options[:test] || false))
+        parse_rate_response(origin, destination, packages, response, options)
+      end
       
-      protected
+#      protected
       
       def upsified_location(location)
         if location.country_code == 'US' && US_TERRITORIES_TREATED_AS_COUNTRIES.include?(location.state)
@@ -132,6 +144,112 @@ module ActiveMerchant
           access_request << XmlNode.new('AccessLicenseNumber', @options[:key])
           access_request << XmlNode.new('UserId', @options[:login])
           access_request << XmlNode.new('Password', @options[:password])
+        end
+        xml_request.to_s
+      end
+
+      def build_shipment_request(origin, destination, packages, options={})
+        packages = Array(packages)
+        xml_request = XmlNode.new('ShipmentConfirmRequest') do |root_node|
+          root_node << XmlNode.new('Request') do |request|
+            request << XmlNode.new('RequestAction', 'ShipConfirm')
+            request << XmlNode.new('RequestOption', 'nonvalidate')
+          end
+
+
+          root_node << XmlNode.new('Shipment') do |shipment|
+            # not implemented: Shipment/Description element
+            shipment << build_location_node('Shipper', (options[:shipper] || origin), options)
+            shipment << build_location_node('ShipTo', destination, options)
+            if options[:shipper] and options[:shipper] != origin
+              shipment << build_location_node('ShipFrom', origin, options)
+            end
+
+            # Service
+            shipment << XmlNode.new("Service") do |service_node|
+              service_node << XmlNode.new("Code", '14')
+              service_node << XmlNode.new("Description", 'Next Day Air Early AM')
+            end
+
+            # Payment
+            shipment << XmlNode.new("PaymentInformation") do |payment_info_node|
+              payment_info_node << XmlNode.new("Prepaid") do |prepaid_node|
+                prepaid_node << XmlNode.new("BillShipper") do |bill_shipper_node|
+                  bill_shipper_node << XmlNode.new("CreditCard") do |credit_card_node|
+                    credit_card_node << XmlNode.new("Type", '06')
+                    credit_card_node << XmlNode.new("Number", '4111111111111111')
+                    credit_card_node << XmlNode.new("ExpirationDate", '121999')
+                  end
+                end
+              end
+            end
+
+
+
+            # not implemented:  * Shipment/ShipmentWeight element
+            #                   * Shipment/ReferenceNumber element
+            #                   * Shipment/Service element
+            #                   * Shipment/PickupDate element
+            #                   * Shipment/ScheduledDeliveryDate element
+            #                   * Shipment/ScheduledDeliveryTime element
+            #                   * Shipment/AlternateDeliveryTime element
+            #                   * Shipment/DocumentsOnly element
+
+            packages.each do |package|
+              imperial = ['US','LR','MM'].include?(origin.country_code(:alpha2))
+
+              shipment << XmlNode.new("Package") do |package_node|
+
+                # not implemented:  * Shipment/Package/PackagingType element
+                #                   * Shipment/Package/Description element
+
+                package_node << XmlNode.new("PackagingType") do |packaging_type|
+                  packaging_type << XmlNode.new("Code", '02')
+                end
+
+                package_node << XmlNode.new("Dimensions") do |dimensions|
+                  dimensions << XmlNode.new("UnitOfMeasurement") do |units|
+                    units << XmlNode.new("Code", imperial ? 'IN' : 'CM')
+                  end
+                  [:length,:width,:height].each do |axis|
+                    value = ((imperial ? package.inches(axis) : package.cm(axis)).to_f*1000).round/1000.0 # 3 decimals
+                    dimensions << XmlNode.new(axis.to_s.capitalize, [value,0.1].max)
+                  end
+                end
+
+                package_node << XmlNode.new("PackageWeight") do |package_weight|
+                  package_weight << XmlNode.new("UnitOfMeasurement") do |units|
+                    units << XmlNode.new("Code", imperial ? 'LBS' : 'KGS')
+                  end
+
+                  value = ((imperial ? package.lbs : package.kgs).to_f*1000).round/1000.0 # 3 decimals
+                  package_weight << XmlNode.new("Weight", [value,0.1].max)
+                end
+
+                # not implemented:  * Shipment/Package/LargePackageIndicator element
+                #                   * Shipment/Package/ReferenceNumber element
+                #                   * Shipment/Package/PackageServiceOptions element
+                #                   * Shipment/Package/AdditionalHandling element
+              end
+
+            end
+
+            # not implemented:  * Shipment/ShipmentServiceOptions element
+            #                   * Shipment/RateInformation element
+
+          end
+
+          # Label Specification
+          root_node << XmlNode.new('LabelSpecification') do |label_specification|
+            label_specification << XmlNode.new("LabelPrintMethod") do |label_print_method|
+              label_print_method << XmlNode.new("Code", 'GIF')
+            end
+            label_specification << XmlNode.new("HTTPUserAgent", 'Mozilla/4.5')
+            label_specification << XmlNode.new("LabelImageFormat") do |label_image_format|
+              label_image_format << XmlNode.new("Code", 'GIF')
+            end
+          end
+
         end
         xml_request.to_s
       end
@@ -279,6 +397,33 @@ module ActiveMerchant
             delivery_date  = days_to_delivery >= 1 ? days_to_delivery.days.from_now.strftime("%Y-%m-%d") : nil
 
             rate_estimates << RateEstimate.new(origin, destination, @@name,
+                                service_name_for(origin, service_code),
+                                :total_price => rated_shipment.get_text('TotalCharges/MonetaryValue').to_s.to_f,
+                                :currency => rated_shipment.get_text('TotalCharges/CurrencyCode').to_s,
+                                :service_code => service_code,
+                                :packages => packages,
+                                :delivery_range => [delivery_date])
+          end
+        end
+        RateResponse.new(success, message, Hash.from_xml(response).values.first, :rates => rate_estimates, :xml => response, :request => last_request)
+      end
+
+      def parse_ship_response(origin, destination, packages, response, options={})
+        rates = []
+
+        xml = REXML::Document.new(response)
+        success = response_success?(xml)
+        message = response_message(xml)
+
+        if success
+          shipment_event = []
+
+          xml.elements.each('/*/ShipmentCharges') do |shipment_charges|
+            service_code = shipment_charges.get_text('Service/Code').to_s
+            days_to_delivery = shipment_charges.get_text('GuaranteedDaysToDelivery').to_s.to_i
+            delivery_date  = days_to_delivery >= 1 ? days_to_delivery.days.from_now.strftime("%Y-%m-%d") : nil
+
+            shipment_event << ShipmentEvent.new(origin, destination, @@name,
                                 service_name_for(origin, service_code),
                                 :total_price => rated_shipment.get_text('TotalCharges/MonetaryValue').to_s.to_f,
                                 :currency => rated_shipment.get_text('TotalCharges/CurrencyCode').to_s,
